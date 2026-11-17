@@ -1,0 +1,378 @@
+package com.nuvio.app.features.streams
+
+import com.nuvio.app.core.build.AppFeaturePolicy
+import com.nuvio.app.core.network.NetworkTransport
+import com.nuvio.app.core.transcode.TranscodeLadder
+import com.nuvio.app.core.transcode.TranscodeUrls
+import com.nuvio.app.features.debrid.DebridStreamMetadata
+import com.nuvio.app.features.debrid.DebridStreamPreferences
+import com.nuvio.app.features.debrid.DebridStreamResolution
+
+object StreamAutoPlaySelector {
+
+    private const val CELLULAR_RESOLUTION_CEILING = 1080
+
+    fun orderAddonStreams(
+        groups: List<AddonStreamGroup>,
+        installedOrder: List<String>,
+        preferredGroupIds: Set<String> = emptySet(),
+    ): List<AddonStreamGroup> {
+        if (groups.isEmpty()) return groups
+        if (preferredGroupIds.isNotEmpty()) {
+            val (preferred, rest) = groups.partition { it.addonId in preferredGroupIds }
+            return preferred + orderAddonStreams(rest, installedOrder)
+        }
+
+        val addonRankByName = HashMap<String, Int>(installedOrder.size)
+        installedOrder.forEachIndexed { index, addonName ->
+            if (addonName !in addonRankByName) {
+                addonRankByName[addonName] = index
+            }
+        }
+
+        val (directDebridEntries, remainingEntries) = groups.partition { group ->
+            group.addonId.startsWith("debrid:") ||
+                group.streams.any { stream -> stream.isAddonDebridCandidate && stream.isDirectDebridStream }
+        }
+        if (installedOrder.isEmpty()) return directDebridEntries + remainingEntries
+
+        val (addonEntries, pluginEntries) = remainingEntries.partition { group ->
+            group.addonName in addonRankByName
+        }
+        val orderedAddons = addonEntries.sortedBy { group ->
+            addonRankByName.getValue(group.addonName)
+        }
+        return directDebridEntries + orderedAddons + pluginEntries
+    }
+
+    fun selectAutoPlayStream(
+        streams: List<StreamItem>,
+        mode: StreamAutoPlayMode,
+        regexPattern: String,
+        source: StreamAutoPlaySource,
+        installedAddonNames: Set<String>,
+        selectedAddons: Set<String>,
+        selectedPlugins: Set<String>,
+        preferredBingeGroup: String? = null,
+        preferBingeGroupInSelection: Boolean = false,
+        bingeGroupOnly: Boolean = false,
+        debridEnabled: Boolean = true,
+        activeResolverProviderId: String? = null,
+        networkTransport: NetworkTransport = NetworkTransport.UNKNOWN,
+        deviceMaxResolutionPx: Int? = null,
+        measuredSpeedMbps: Double? = null,
+        transcodeSpeedMbps: Double? = null,
+    ): StreamItem? =
+        evaluateAutoPlayStream(
+            streams = streams,
+            mode = mode,
+            regexPattern = regexPattern,
+            source = source,
+            installedAddonNames = installedAddonNames,
+            selectedAddons = selectedAddons,
+            selectedPlugins = selectedPlugins,
+            preferredBingeGroup = preferredBingeGroup,
+            preferBingeGroupInSelection = preferBingeGroupInSelection,
+            bingeGroupOnly = bingeGroupOnly,
+            debridEnabled = debridEnabled,
+            activeResolverProviderId = activeResolverProviderId,
+            networkTransport = networkTransport,
+            deviceMaxResolutionPx = deviceMaxResolutionPx,
+            measuredSpeedMbps = measuredSpeedMbps,
+            transcodeSpeedMbps = transcodeSpeedMbps,
+        ).stream
+
+    fun evaluateAutoPlayStream(
+        streams: List<StreamItem>,
+        mode: StreamAutoPlayMode,
+        regexPattern: String,
+        source: StreamAutoPlaySource,
+        installedAddonNames: Set<String>,
+        selectedAddons: Set<String>,
+        selectedPlugins: Set<String>,
+        preferredBingeGroup: String? = null,
+        preferBingeGroupInSelection: Boolean = false,
+        bingeGroupOnly: Boolean = false,
+        debridEnabled: Boolean = true,
+        activeResolverProviderId: String? = null,
+        networkTransport: NetworkTransport = NetworkTransport.UNKNOWN,
+        deviceMaxResolutionPx: Int? = null,
+        measuredSpeedMbps: Double? = null,
+        transcodeSpeedMbps: Double? = null,
+    ): StreamAutoPlayEvaluation {
+        if (streams.isEmpty()) return StreamAutoPlayEvaluation()
+
+        val sourceScopedStreams = when (source) {
+            StreamAutoPlaySource.ALL_SOURCES -> streams
+            StreamAutoPlaySource.INSTALLED_ADDONS_ONLY -> streams.filter { it.serverTarget != null || it.addonName in installedAddonNames }
+            StreamAutoPlaySource.ENABLED_PLUGINS_ONLY -> streams.filter { it.addonName !in installedAddonNames }
+        }
+        val candidateStreams = sourceScopedStreams.filter { stream ->
+            val isAddonStream = stream.addonName in installedAddonNames
+            if (stream.serverTarget != null) {
+                true
+            } else if (isAddonStream) {
+                selectedAddons.isEmpty() || stream.addonName in selectedAddons
+            } else {
+                selectedPlugins.isEmpty() || stream.addonName in selectedPlugins
+            }
+        }
+        if (candidateStreams.isEmpty()) return StreamAutoPlayEvaluation()
+        if (mode == StreamAutoPlayMode.MANUAL && !bingeGroupOnly) {
+            return StreamAutoPlayEvaluation()
+        }
+
+        val targetBingeGroup = preferredBingeGroup?.trim().orEmpty()
+        val bingeGroupCandidates = if (preferBingeGroupInSelection && targetBingeGroup.isNotEmpty()) {
+            candidateStreams.filter { stream -> stream.behaviorHints.bingeGroup == targetBingeGroup }
+        } else {
+            emptyList()
+        }
+        val preferredReadyStream = bingeGroupCandidates.firstOrNull { stream ->
+            stream.isAutoPlayable(debridEnabled, activeResolverProviderId)
+        }
+        if (bingeGroupOnly) {
+            val readyStreams = preferredReadyStream?.let(::listOf).orEmpty()
+            return StreamAutoPlayEvaluation(
+                stream = preferredReadyStream,
+                readyStreams = readyStreams,
+                hasPendingDebridCandidate = preferredReadyStream == null &&
+                    bingeGroupCandidates.any {
+                        it.isPendingDebridAutoPlay(debridEnabled, activeResolverProviderId)
+                    },
+            )
+        }
+        if (mode == StreamAutoPlayMode.MANUAL) {
+            return StreamAutoPlayEvaluation()
+        }
+        val preferredStream = if (preferBingeGroupInSelection && targetBingeGroup.isNotEmpty()) {
+            candidateStreams.firstOrNull { stream ->
+                stream.behaviorHints.bingeGroup == targetBingeGroup &&
+                    stream.isAutoPlayable(debridEnabled, activeResolverProviderId)
+            }
+        } else {
+            null
+        }
+        val matchingStreams = when (mode) {
+            StreamAutoPlayMode.MANUAL -> emptyList()
+            StreamAutoPlayMode.FIRST_STREAM -> candidateStreams
+            StreamAutoPlayMode.NETWORK_QUALITY -> rankByNetworkQuality(
+                candidateStreams,
+                networkTransport,
+                deviceMaxResolutionPx,
+                measuredSpeedMbps,
+                transcodeSpeedMbps,
+            )
+            StreamAutoPlayMode.REGEX_MATCH -> {
+                val pattern = regexPattern.trim()
+
+                val userRegex = runCatching { Regex(pattern, RegexOption.IGNORE_CASE) }.getOrNull()
+                    ?: return StreamAutoPlayEvaluation()
+
+                val exclusionMatches = Regex("\\(\\?![^)]*?\\(([^)]+)\\)").findAll(pattern)
+
+                val exclusionWords = exclusionMatches
+                    .flatMap { match -> match.groupValues[1].split("|") }
+                    .map { it.trim() }
+                    .filter { it.isNotBlank() }
+                    .toList()
+
+                val excludeRegex = if (exclusionWords.isNotEmpty()) {
+                    Regex(
+                        "\\b(${exclusionWords.joinToString("|") { Regex.escape(it) }})\\b",
+                        RegexOption.IGNORE_CASE,
+                    )
+                } else null
+
+                candidateStreams.filter { stream ->
+                    val url = stream.playableDirectUrl.orEmpty()
+
+                    val searchableText = buildString {
+                        append(stream.addonName).append(' ')
+                        append(stream.name.orEmpty()).append(' ')
+                        append(stream.streamLabel).append(' ')
+                        append(stream.description.orEmpty()).append(' ')
+                        append(url)
+                    }
+
+                    if (!userRegex.containsMatchIn(searchableText)) return@filter false
+
+                    if (excludeRegex != null && excludeRegex.containsMatchIn(searchableText)) {
+                        return@filter false
+                    }
+
+                    true
+                }
+            }
+        }
+        if (matchingStreams.isEmpty() && preferredStream == null) return StreamAutoPlayEvaluation()
+
+        val readyStreams = buildList {
+            preferredStream?.let(::add)
+            matchingStreams
+                .filter { it.isAutoPlayable(debridEnabled, activeResolverProviderId) }
+                .filterNot { it == preferredStream }
+                .forEach(::add)
+        }
+        val selected = readyStreams.firstOrNull()
+        if (selected != null) {
+            return StreamAutoPlayEvaluation(
+                stream = selected,
+                readyStreams = readyStreams,
+            )
+        }
+
+        return StreamAutoPlayEvaluation(
+            readyStreams = readyStreams,
+            hasPendingDebridCandidate = matchingStreams.any {
+                it.isPendingDebridAutoPlay(debridEnabled, activeResolverProviderId)
+            },
+        )
+    }
+
+    private fun rankByNetworkQuality(
+        candidates: List<StreamItem>,
+        networkTransport: NetworkTransport,
+        deviceMaxResolutionPx: Int?,
+        measuredSpeedMbps: Double?,
+        transcodeSpeedMbps: Double?,
+    ): List<StreamItem> {
+        val transcodeFirst = rankTranscodeStreams(candidates, networkTransport, transcodeSpeedMbps)
+        if (transcodeFirst.isNotEmpty()) {
+            return transcodeFirst + rankByNetworkQuality(
+                candidates - transcodeFirst.toSet(), networkTransport, deviceMaxResolutionPx, measuredSpeedMbps, null,
+            )
+        }
+        val withinDeviceCap = candidates.filter { stream ->
+            fitsDeviceResolutionCap(stream.autoPlayResolutionValue(), deviceMaxResolutionPx)
+        }
+        if (withinDeviceCap.isEmpty()) return emptyList()
+
+        val networkCeiling = when (networkTransport) {
+            NetworkTransport.CELLULAR -> CELLULAR_RESOLUTION_CEILING
+            NetworkTransport.WIFI, NetworkTransport.OTHER, NetworkTransport.UNKNOWN -> Int.MAX_VALUE
+        }
+
+        val effectiveMaxMbps = measuredSpeedMbps?.times(0.75) // 75% usable bandwidth budget
+
+        val (withinBudget, overBudget) = withinDeviceCap.partition { stream ->
+            val fitsNetwork = stream.autoPlayResolutionValue() <= networkCeiling
+            val fitsBitrate = if (effectiveMaxMbps != null) {
+                val streamBitrate = streamEstimatedBitrateMbps(stream)
+                streamBitrate == null || streamBitrate <= effectiveMaxMbps
+            } else true
+            fitsNetwork && fitsBitrate
+        }
+        val orderedWithinBudget = withinBudget.sortedByDescending { it.autoPlayResolutionValue() }
+        val orderedOverBudget = overBudget.sortedBy { it.autoPlayResolutionValue() }
+        return orderedWithinBudget + orderedOverBudget
+    }
+
+    /**
+     * Streams from the transcode proxy go first: the tier whose bitrate fits the measured proxy
+     * throughput (with headroom), then the remaining tiers closest-first. Playback then adapts in-player.
+     */
+    internal fun rankTranscodeStreams(
+        candidates: List<StreamItem>,
+        networkTransport: NetworkTransport,
+        transcodeSpeedMbps: Double?,
+    ): List<StreamItem> {
+        val tiered = candidates.mapNotNull { stream ->
+            val tier = stream.playableDirectUrl?.let(TranscodeUrls::tierOf) ?: return@mapNotNull null
+            stream to TranscodeLadder.indexOf(tier)
+        }
+        if (tiered.isEmpty()) return emptyList()
+        val target = when {
+            transcodeSpeedMbps != null -> TranscodeLadder.selectTier(transcodeSpeedMbps)
+            networkTransport == NetworkTransport.CELLULAR -> TranscodeLadder.cellularStartTier
+            else -> TranscodeLadder.defaultStartTier
+        }
+        val targetIndex = TranscodeLadder.indexOf(target)
+        // Fitting tiers (<= target) best-first, then higher tiers lowest-first as a last resort. Stable by list order.
+        return tiered
+            .sortedWith(compareBy({ if (it.second <= targetIndex) 0 else 1 }, { if (it.second <= targetIndex) -it.second else it.second }))
+            .map { it.first }
+    }
+
+    private fun StreamItem.autoPlayResolutionValue(): Int =
+        DebridStreamMetadata.facts(this, DebridStreamPreferences()).resolution.value
+
+    private fun streamEstimatedBitrateMbps(stream: StreamItem): Double? {
+        val sizeBytes = stream.clientResolve?.stream?.raw?.size
+            ?: stream.behaviorHints.videoSize
+            ?: stream.debridCacheStatus?.cachedSize
+            ?: parseSizeFromText(stream)
+            ?: return null
+
+        val durationSec = 5400.0 // 90 minutes baseline
+        return (sizeBytes * 8.0) / (durationSec * 1_000_000.0)
+    }
+
+    private fun parseSizeFromText(stream: StreamItem): Long? {
+        val text = listOfNotNull(stream.name, stream.title, stream.description).joinToString(" ")
+        val match = Regex("""(\d+(?:\.\d+)?)\s*(GB|MB|GiB|MiB)""", RegexOption.IGNORE_CASE).find(text) ?: return null
+        val (numStr, unit) = match.destructured
+        val num = numStr.toDoubleOrNull() ?: return null
+        return when (unit.uppercase()) {
+            "GB", "GIB" -> (num * 1024 * 1024 * 1024).toLong()
+            "MB", "MIB" -> (num * 1024 * 1024).toLong()
+            else -> null
+        }
+    }
+
+    private fun fitsDeviceResolutionCap(resolutionValue: Int, deviceMaxResolutionPx: Int?): Boolean {
+        if (deviceMaxResolutionPx == null || resolutionValue <= 0) return true
+        val requiredLongEdgePx = when {
+            resolutionValue >= DebridStreamResolution.P2160.value -> 3840
+            resolutionValue >= DebridStreamResolution.P1440.value -> 2560
+            resolutionValue >= DebridStreamResolution.P1080.value -> 1920
+            resolutionValue >= DebridStreamResolution.P720.value -> 1280
+            resolutionValue >= DebridStreamResolution.P576.value -> 1024
+            resolutionValue >= DebridStreamResolution.P480.value -> 854
+            else -> 640
+        }
+        return requiredLongEdgePx <= deviceMaxResolutionPx
+    }
+
+    private fun StreamItem.isAutoPlayable(
+        debridEnabled: Boolean,
+        activeResolverProviderId: String?,
+    ): Boolean =
+        playableDirectUrl != null ||
+            serverTarget != null ||
+            (
+                AppFeaturePolicy.p2pEnabled &&
+                    needsLocalDebridResolve &&
+                    p2pInfoHash != null &&
+                    !isPendingDebridAutoPlay(debridEnabled, activeResolverProviderId)
+            ) ||
+            (debridEnabled && isAddonDebridCandidate && isReadyDebridAutoPlay(activeResolverProviderId))
+
+    private fun StreamItem.isReadyDebridAutoPlay(activeResolverProviderId: String?): Boolean =
+        when {
+            isDirectDebridStream -> clientResolve?.service.matchesResolver(activeResolverProviderId)
+            isCachedDebridTorrentStream -> debridCacheStatus?.providerId.matchesResolver(activeResolverProviderId)
+            else -> false
+        }
+
+    private fun StreamItem.isPendingDebridAutoPlay(
+        debridEnabled: Boolean,
+        activeResolverProviderId: String?,
+    ): Boolean {
+        if (!debridEnabled || !isInstalledAddonStream || !needsLocalDebridResolve) return false
+        if (!debridCacheStatus?.providerId.matchesResolver(activeResolverProviderId)) return false
+        val state = debridCacheStatus?.state
+        return state == null || state == StreamDebridCacheState.CHECKING
+    }
+
+    private fun String?.matchesResolver(activeResolverProviderId: String?): Boolean {
+        val active = activeResolverProviderId?.trim().orEmpty()
+        return active.isBlank() || this == null || equals(active, ignoreCase = true)
+    }
+}
+
+data class StreamAutoPlayEvaluation(
+    val stream: StreamItem? = null,
+    val readyStreams: List<StreamItem> = emptyList(),
+    val hasPendingDebridCandidate: Boolean = false,
+)

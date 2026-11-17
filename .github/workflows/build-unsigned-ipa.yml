@@ -1,0 +1,288 @@
+name: Build Unsigned iOS IPA (SideStore sideload)
+
+# Manual only -- this is Jan's own personal sideload pipeline for Nuvio
+# Mobile (upstream: https://github.com/NuvioMedia/NuvioMobile, GPL-3.0),
+# built from this fork rather than upstream so it doesn't need to touch
+# NuvioMedia's repo. SideStore signs the app itself with a free Apple ID at
+# install time, so this deliberately builds with code signing turned OFF,
+# using a real Xcode toolchain on a GitHub-hosted macOS runner.
+#
+# Distribution is forced to NUVIO_IOS_DISTRIBUTION=appstore (not "full"):
+# the "full" flavor requires a private sibling ../nuvio-engine XCFramework
+# that only the Nuvio maintainers have -- this fork can't build it.
+#
+# Also publishes a SideStore/AltStore "source" (source.json + the ipa + the
+# app icon) to a stable-URL GitHub Release, tag `ios-latest`, with its
+# assets overwritten on every run. Add that source.json's raw URL to
+# SideStore once (Browse tab -> paste URL -> Add Source) and every future
+# run of this workflow shows up there as a normal one-tap Update.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # Reverted 2026-09-05 back to macos-latest (was self-hosted on Jan's
+    # Mac Mini, 53bb267e, 2026-08-23) -- the self-hosted runner's only
+    # real advantage was avoiding cold-start cost (Xcode/Gradle/Kotlin-
+    # Native/SPM toolchain persisting on disk between runs), but the Mac
+    # Mini goes offline/unreachable often enough (sleep, network drops)
+    # that builds/ships were blocked waiting on it. This repo is public,
+    # so GitHub-hosted macOS Actions minutes are free -- no cost tradeoff
+    # to reverting. If the Mac Mini's reliability improves and cold-start
+    # time becomes the bigger pain point again, 53bb267e has the
+    # self-hosted config to restore.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history -- needed for the commit-count build-number stamp below
+
+      - name: Init MPVKit submodule (local SPM package the Xcode project links against)
+        # Only MPVKit -- the repo also carries an unrelated stale gitlink
+        # (libass-android) with no matching .gitmodules entry, so a blanket
+        # `--recursive` init would fail on it.
+        run: git submodule update --init MPVKit
+
+      - name: Stamp build number from commit count
+        # Upstream's Version.xcconfig pins CURRENT_PROJECT_VERSION to a
+        # static value (e.g. 112) that only changes when the Nuvio
+        # maintainers bump it themselves. Left as-is, an upstream sync could
+        # bring in real code changes while buildVersion stays identical, and
+        # SideStore would never offer the update. Stamp it with the commit
+        # count of the exact tree being built instead -- it only ever goes
+        # up, and only when there's actually a new commit to build.
+        run: |
+          COUNT=$(git rev-list --count HEAD)
+          sed -i '' "s/^CURRENT_PROJECT_VERSION=.*/CURRENT_PROJECT_VERSION=${COUNT}/" iosApp/Configuration/Version.xcconfig
+          echo "Stamped CURRENT_PROJECT_VERSION=${COUNT}"
+          cat iosApp/Configuration/Version.xcconfig
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Write local.properties with public Supabase config + Trakt credentials
+        # composeApp's generateRuntimeConfigs Gradle task declares
+        # local.properties as a required @InputFile, so it must exist -- but
+        # an empty file (the earlier fix) left NUVIO_SUPABASE_URL/ANON_KEY
+        # unset, so the built app's Ktor client defaulted every backend call
+        # to https://localhost and failed to connect to anything at all
+        # (confirmed on-device: NSURLErrorDomain -1004 on every API call,
+        # e.g. account deletion). This is the same class of bug already
+        # fixed for Nuvio Desktop.
+        #
+        # NUVIO_SUPABASE_ANON_KEY is NOT a secret: it's a public,
+        # RLS-protected anon-role JWT meant to ship in every client
+        # (Nuvio's own official Android APK embeds the identical pair) --
+        # it's the equivalent of a public API base URL, not a credential.
+        # TRAKT_CLIENT_SECRET IS a real credential (unlike the Supabase key
+        # above) and this build is publicly downloadable, so both Trakt
+        # values come from GitHub Actions secrets (2026-08-27) rather than
+        # being hardcoded here, and are passed through env: so they never
+        # appear in the workflow file or step logs. Sentry stays unset;
+        # that's still genuinely optional (confirmed earlier).
+        env:
+          TRAKT_CLIENT_ID: ${{ secrets.TRAKT_CLIENT_ID }}
+          TRAKT_CLIENT_SECRET: ${{ secrets.TRAKT_CLIENT_SECRET }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NUVIOTRACK_SERVER: ${{ secrets.NUVIOTRACK_SERVER }}
+          NUVIOTRACK_API_KEY: ${{ secrets.NUVIOTRACK_API_KEY }}
+        run: |
+          cat > local.properties <<EOF
+          NUVIO_SUPABASE_URL=https://api.nuvio.tv
+          NUVIO_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzgxNTIxMzQ2LCJleHAiOjE5MzkyMDEzNDZ9.tmQaj682pwzehpqlgCDMnySOqiUvpgRbrE43T4VJpDI
+          TRAKT_CLIENT_ID=${TRAKT_CLIENT_ID}
+          TRAKT_CLIENT_SECRET=${TRAKT_CLIENT_SECRET}
+          TRAKT_REDIRECT_URI=nuvio://auth/trakt
+          NTFY_TOPIC=${NTFY_TOPIC}
+          NUVIOTRACK_SERVER=${NUVIOTRACK_SERVER}
+          NUVIOTRACK_API_KEY=${NUVIOTRACK_API_KEY}
+          EOF
+
+      - name: Xcode version
+        run: xcodebuild -version
+
+      - name: Resolve Swift Package dependencies (MPVKit + friends)
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project iosApp/iosApp.xcodeproj \
+            -scheme iosApp
+
+      - name: Archive (unsigned, real device build)
+        env:
+          NUVIO_IOS_DISTRIBUTION: appstore
+        # Signs ad-hoc (identity "-") rather than CODE_SIGNING_ALLOWED=NO.
+        # A previous investigation into a build that shipped without the
+        # real Supabase config chased this flag as a suspected cause --
+        # ":composeApp:embedAndSignAppleFrameworkForXcode SKIPPED" in the
+        # Gradle log looked alarming -- but that turned out to be a false
+        # lead: ComposeApp is built with isStatic=true (see composeApp/
+        # build.gradle.kts), so it links directly into the main executable
+        # at compile time; the "embed" task is a dynamic-framework concept
+        # and is CORRECTLY a no-op here regardless of this signing setting.
+        # The real bug was in the verification step below (a `strings`
+        # encoding blind spot), already fixed there. Left as ad-hoc signing
+        # anyway since it's proven working (confirmed via a diagnostic run:
+        # 124889 Kotlin/Native symbols correctly present in the compiled
+        # binary) -- not worth spending another full CI cycle reverting an
+        # already-verified-correct config just for tidiness. Our own
+        # explicit ad-hoc codesign step right after this one re-signs
+        # everything from scratch regardless, so whatever signature Xcode/
+        # Gradle's own pass produces here doesn't need to be "correct".
+        run: |
+          xcodebuild archive \
+            -project iosApp/iosApp.xcodeproj \
+            -scheme iosApp \
+            -configuration Debug \
+            -archivePath "$PWD/build/Nuvio.xcarchive" \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGN_STYLE=Manual \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            DEVELOPMENT_TEAM=""
+
+      - name: Ad-hoc codesign the app (SideStore needs a real signature to replace)
+        # The archive step above now signs ad-hoc itself (CODE_SIGN_IDENTITY=
+        # "-", required to keep Gradle's embedAndSignAppleFrameworkForXcode
+        # task from skipping itself -- see the comment on that step). We
+        # still do a full explicit re-sign here regardless, innermost-out,
+        # as the actual source of truth: SideStore/AltStore-family installers
+        # read an app's *existing* entitlements out of its current signature
+        # to build the provisioning profile it installs with, so we want a
+        # signature we've verified ourselves rather than trusting whatever
+        # Xcode/Gradle's own ad-hoc pass produced. `--force` makes this safe
+        # to run whether or not a signature already exists.
+        run: |
+          cd build/Nuvio.xcarchive/Products/Applications
+          APP=$(ls -d *.app | head -1)
+          find "$APP" \( -name "*.framework" -o -name "*.appex" \) -print0 \
+            | xargs -0 -I{} codesign --force --sign - "{}"
+          codesign --force --deep --sign - "$APP"
+          echo "--- verifying signature ---"
+          codesign -dv --verbose=4 "$APP" 2>&1
+          echo "--- LC_CODE_SIGNATURE present? ---"
+          EXEC=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist")
+          otool -l "$APP/$EXEC" | grep -A2 LC_CODE_SIGNATURE
+
+      - name: Read app version + build + bundle id from the BUILT Info.plist
+        id: appmeta
+        # Read these straight out of the .app Xcode actually produced, never
+        # computed independently (e.g. from a run counter) -- otherwise
+        # source.json can drift from the real binary and SideStore refuses
+        # to install with a version/build mismatch error.
+        run: |
+          cd build/Nuvio.xcarchive/Products/Applications
+          APP=$(ls -d *.app | head -1)
+          PLIST="$APP/Info.plist"
+          VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PLIST")
+          BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$PLIST")
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$PLIST")
+          echo "Built app actually reports: app=$APP version=$VERSION build=$BUILD bundle_id=$BUNDLE_ID"
+          echo "app_name=$APP" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "bundle_id=$BUNDLE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the real Supabase backend got baked in (not localhost)
+        # Permanent regression guard for the "every backend call hits
+        # localhost" class of bug: fails the build outright if the compiled
+        # binary doesn't actually contain the real API host, instead of
+        # silently shipping an app that can't connect to anything.
+        #
+        # NOTE: plain `strings` on the executable is NOT enough here and
+        # gave a false failure once already. Kotlin's String type is UTF-16
+        # internally, so a `const val` string's actual VALUE can end up
+        # encoded as UTF-16 in the binary even though ASCII/UTF-8 symbol
+        # names (e.g. Objective-C selectors like `supabaseUrl`) show up in
+        # plain `strings` just fine -- confirmed live: a diagnostic run
+        # found 124889 Kotlin/Native symbols and plenty of Supabase-related
+        # SYMBOL NAMES in the binary (createSupabaseClient:config:,
+        # supabaseUrl, supabaseKey, etc.), proving the framework linked in
+        # correctly, while the literal string "api.nuvio.tv" still didn't
+        # show up under plain `strings` -- a false negative in the check
+        # itself, not a real bug in the app. Search raw bytes for both
+        # UTF-8 and UTF-16 (both byte orders) instead of trusting `strings`.
+        run: |
+          cd build/Nuvio.xcarchive/Products/Applications
+          APP=$(ls -d *.app | head -1)
+          EXEC=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist")
+          echo "--- searching compiled binary for api.nuvio.tv (UTF-8 and UTF-16, both byte orders) ---"
+          FOUND=$(/usr/bin/python3 -c "data = open('$APP/$EXEC', 'rb').read(); needle = 'api.nuvio.tv'; hits = [e for e in ('utf-8', 'utf-16-le', 'utf-16-be') if needle.encode(e) in data]; print(','.join(hits))")
+          if [ -z "$FOUND" ]; then
+            echo "::error::api.nuvio.tv not found in the built executable under any encoding (utf-8, utf-16-le, utf-16-be) -- local.properties' NUVIO_SUPABASE_URL likely didn't make it into this build. The app would ship unable to reach any backend."
+            exit 1
+          fi
+          echo "OK: api.nuvio.tv is present in the compiled binary (encoding(s): $FOUND)."
+          echo "--- searching for a literal https://localhost string (informational only -- may just be an SDK-internal fallback constant unrelated to our config) ---"
+          strings "$APP/$EXEC" | grep -n "https://localhost" || echo "(none found)"
+
+      - name: Package raw IPA (Payload/*.app zipped, no signing)
+        id: package
+        run: |
+          cd build/Nuvio.xcarchive/Products/Applications
+          APP=$(ls -d *.app | head -1)
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -r -y ../../../Nuvio.ipa Payload
+          SIZE=$(stat -f%z ../../../Nuvio.ipa)
+          echo "Built: $(ls -la ../../../Nuvio.ipa)"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+
+      - name: Extract app icon
+        run: cp "iosApp/iosApp/Assets.xcassets/AppIcon.appiconset/app-icon-1024.png" build/icon.png
+
+      - name: Generate SideStore/AltStore source.json
+        run: |
+          cat > build/source.json <<EOF
+          {
+            "name": "Jan's Nuvio builds",
+            "identifier": "nl.jdries.nuvio.source",
+            "apps": [
+              {
+                "name": "Nuvio",
+                "bundleIdentifier": "${{ steps.appmeta.outputs.bundle_id }}",
+                "developerName": "NuvioMedia (unofficial sideload build via janibert1)",
+                "localizedDescription": "Unofficial personal sideload build of Nuvio Mobile (open-source, GPL-3.0) -- auto-built from janibert1/NuvioMobile (fork of NuvioMedia/NuvioMobile).",
+                "iconURL": "https://github.com/${{ github.repository }}/releases/download/ios-latest/icon.png",
+                "versions": [
+                  {
+                    "version": "${{ steps.appmeta.outputs.version }}",
+                    "buildVersion": "${{ steps.appmeta.outputs.build }}",
+                    "date": "$(date -u +%Y-%m-%d)",
+                    "localizedDescription": "Build ${{ steps.appmeta.outputs.build }} (run #${{ github.run_number }}) from commit ${{ github.sha }}",
+                    "downloadURL": "https://github.com/${{ github.repository }}/releases/download/ios-latest/Nuvio.ipa",
+                    "size": ${{ steps.package.outputs.size }}
+                  }
+                ],
+                "appPermissions": { "entitlements": [], "privacy": {} }
+              }
+            ],
+            "news": []
+          }
+          EOF
+          cat build/source.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nuvio-unsigned-ipa
+          path: build/Nuvio.ipa
+          retention-days: 14
+
+      - name: Publish to stable-URL release (assets overwritten each run)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ios-latest
+          name: "iOS build (auto-updated, latest run wins)"
+          body: "Personal unofficial sideload build of Nuvio Mobile for SideStore, built from janibert1/NuvioMobile (a fork of NuvioMedia/NuvioMobile, GPL-3.0). Not a real release -- assets here are overwritten on every workflow run. Add source.json's URL as a SideStore source to get one-tap updates."
+          prerelease: true
+          files: |
+            build/Nuvio.ipa
+            build/source.json
+            build/icon.png
